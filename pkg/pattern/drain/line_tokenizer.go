@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"unicode"
+	"unique"
 
 	"github.com/buger/jsonparser"
 	gologfmt "github.com/go-logfmt/logfmt"
@@ -13,9 +14,9 @@ import (
 )
 
 type LineTokenizer interface {
-	Tokenize(line string, tokens []string, state interface{}) ([]string, interface{})
-	Join(tokens []string, state interface{}) string
-	Clone(tokens []string, state interface{}) ([]string, interface{})
+	Tokenize(line string, tokens []unique.Handle[string], state interface{}) ([]unique.Handle[string], interface{})
+	Join(tokens []unique.Handle[string], state interface{}) string
+	Clone(tokens []unique.Handle[string], state interface{}) ([]unique.Handle[string], interface{})
 }
 
 type spacesTokenizer struct{}
@@ -28,8 +29,8 @@ func (spacesTokenizer) Join(tokens []string, _ interface{}) string {
 	return strings.Join(tokens, " ")
 }
 
-func (spacesTokenizer) Clone(tokens []string, _ interface{}) ([]string, interface{}) {
-	res := make([]string, len(tokens))
+func (spacesTokenizer) Clone(tokens []unique.Handle[string], _ interface{}) ([]unique.Handle[string], interface{}) {
+	res := make([]unique.Handle[string], len(tokens))
 	copy(res, tokens)
 	return res, nil
 }
@@ -54,9 +55,9 @@ func newPunctuationTokenizer() *punctuationTokenizer {
 	}
 }
 
-func (p *punctuationTokenizer) Tokenize(line string, tokens []string, state interface{}) ([]string, interface{}) {
+func (p *punctuationTokenizer) Tokenize(line string, tokens []unique.Handle[string], state interface{}) ([]unique.Handle[string], interface{}) {
 	if cap(tokens) == 0 {
-		tokens = make([]string, 0, 128)
+		tokens = make([]unique.Handle[string], 0, 128)
 	}
 	tokens = tokens[:0]
 	if state == nil || cap(state.([]int)) == 0 {
@@ -76,30 +77,30 @@ func (p *punctuationTokenizer) Tokenize(line string, tokens []string, state inte
 		included := char < 128 && p.includeDelimiters[char] != 0
 		if char == ' ' || included || unicode.IsPunct(char) {
 			if i > start {
-				tokens = append(tokens, line[start:i])
+				tokens = append(tokens, unique.Make(line[start:i]))
 			}
 			if char == ' ' {
 				spacesAfter = append(spacesAfter, len(tokens)-1)
 			} else {
-				tokens = append(tokens, line[i:i+1])
+				tokens = append(tokens, unique.Make(line[i:i+1]))
 			}
 			start = i + 1
 		}
 	}
 
 	if start < len(line) {
-		tokens = append(tokens, line[start:])
+		tokens = append(tokens, unique.Make(line[start:]))
 	}
 
 	return tokens, spacesAfter
 }
 
-func (p *punctuationTokenizer) Join(tokens []string, state interface{}) string {
+func (p *punctuationTokenizer) Join(tokens []unique.Handle[string], state interface{}) string {
 	spacesAfter := state.([]int)
 	strBuilder := strings.Builder{}
 	spacesIdx := 0
 	for i, token := range tokens {
-		strBuilder.WriteString(token)
+		strBuilder.WriteString(token.Value())
 		for spacesIdx < len(spacesAfter) && i == spacesAfter[spacesIdx] {
 			// One entry for each space following the token
 			strBuilder.WriteRune(' ')
@@ -109,11 +110,9 @@ func (p *punctuationTokenizer) Join(tokens []string, state interface{}) string {
 	return strBuilder.String()
 }
 
-func (p *punctuationTokenizer) Clone(tokens []string, state interface{}) ([]string, interface{}) {
-	res := make([]string, len(tokens))
-	for i, token := range tokens {
-		res[i] = strings.Clone(token)
-	}
+func (p *punctuationTokenizer) Clone(tokens []unique.Handle[string], state interface{}) ([]unique.Handle[string], interface{}) {
+	res := make([]unique.Handle[string], len(tokens))
+	copy(res, tokens)
 	if state == nil {
 		return res, nil
 	}
@@ -175,11 +174,9 @@ func (splittingTokenizer) Join(tokens []string, state interface{}) string {
 	return strBuilder.String()
 }
 
-func (splittingTokenizer) Clone(tokens []string, state interface{}) ([]string, interface{}) {
-	res := make([]string, len(tokens))
-	for i, token := range tokens {
-		res[i] = strings.Clone(token)
-	}
+func (splittingTokenizer) Clone(tokens []unique.Handle[string], state interface{}) ([]unique.Handle[string], interface{}) {
+	res := make([]unique.Handle[string], len(tokens))
+	copy(res, tokens)
 	if state == nil {
 		return res, nil
 	}
@@ -191,31 +188,31 @@ func (splittingTokenizer) Clone(tokens []string, state interface{}) ([]string, i
 
 type logfmtTokenizer struct {
 	dec        *logfmt.Decoder
-	varReplace string
+	varReplace unique.Handle[string]
 }
 
-func newLogfmtTokenizer(varReplace string) *logfmtTokenizer {
+func newLogfmtTokenizer(varReplace unique.Handle[string]) *logfmtTokenizer {
 	return &logfmtTokenizer{
 		dec:        logfmt.NewDecoder(nil),
 		varReplace: varReplace,
 	}
 }
 
-func (t *logfmtTokenizer) Tokenize(line string, tokens []string, _ interface{}) ([]string, interface{}) {
+func (t *logfmtTokenizer) Tokenize(line string, tokens []unique.Handle[string], _ interface{}) ([]unique.Handle[string], interface{}) {
 	if cap(tokens) == 0 {
-		tokens = make([]string, 0, 64)
+		tokens = make([]unique.Handle[string], 0, 64)
 	}
 	tokens = tokens[:0]
 	t.dec.Reset(unsafeBytes(line))
 	for !t.dec.EOL() && t.dec.ScanKeyval() {
 		key := t.dec.Key()
 		if isVariableField(key) {
-			tokens = append(tokens, unsafeString(t.dec.Key()), t.varReplace)
+			tokens = append(tokens, unique.Make(unsafeString(t.dec.Key())), t.varReplace)
 
 			continue
 		}
 		// todo we want to pass bytes and let user copy if needed.
-		tokens = append(tokens, unsafeString(t.dec.Key()), unsafeString(t.dec.Value()))
+		tokens = append(tokens, unique.Make(unsafeString(t.dec.Key())), unique.Make(unsafeString(t.dec.Value())))
 	}
 	if t.dec.Err() != nil {
 		return nil, nil
@@ -223,17 +220,17 @@ func (t *logfmtTokenizer) Tokenize(line string, tokens []string, _ interface{}) 
 	return tokens, nil
 }
 
-func (t *logfmtTokenizer) Join(tokens []string, _ interface{}) string {
+func (t *logfmtTokenizer) Join(tokens []unique.Handle[string], _ interface{}) string {
 	if len(tokens) == 0 {
 		return ""
 	}
 	if len(tokens)%2 == 1 {
-		tokens = append(tokens, "")
+		tokens = append(tokens, unique.Make(""))
 	}
 	buf := bytes.NewBuffer(make([]byte, 0, 1024))
 	enc := gologfmt.NewEncoder(buf)
 	for i := 0; i < len(tokens); i += 2 {
-		k, v := tokens[i], unsafeBytes(tokens[i+1])
+		k, v := tokens[i].Value(), unsafeBytes(tokens[i+1].Value())
 		if err := enc.EncodeKeyval(k, v); err != nil {
 			return ""
 		}
@@ -241,24 +238,22 @@ func (t *logfmtTokenizer) Join(tokens []string, _ interface{}) string {
 	return buf.String()
 }
 
-func (t *logfmtTokenizer) Clone(tokens []string, _ interface{}) ([]string, interface{}) {
-	res := make([]string, len(tokens))
-	for i, token := range tokens {
-		res[i] = strings.Clone(token)
-	}
+func (t *logfmtTokenizer) Clone(tokens []unique.Handle[string], _ interface{}) ([]unique.Handle[string], interface{}) {
+	res := make([]unique.Handle[string], len(tokens))
+	copy(res, tokens)
 	return res, nil
 }
 
 type jsonTokenizer struct {
 	*punctuationTokenizer
-	varReplace string
+	varReplace unique.Handle[string]
 }
 
-func newJSONTokenizer(varReplace string) *jsonTokenizer {
+func newJSONTokenizer(varReplace unique.Handle[string]) *jsonTokenizer {
 	return &jsonTokenizer{newPunctuationTokenizer(), varReplace}
 }
 
-func (t *jsonTokenizer) Tokenize(line string, tokens []string, state interface{}) ([]string, interface{}) {
+func (t *jsonTokenizer) Tokenize(line string, tokens []unique.Handle[string], state interface{}) ([]unique.Handle[string], interface{}) {
 	var found []byte
 	for _, key := range []string{"log", "message", "msg", "msg_", "_msg", "content"} {
 		msg, ty, _, err := jsonparser.Get(unsafeBytes(line), key)
@@ -275,8 +270,8 @@ func (t *jsonTokenizer) Tokenize(line string, tokens []string, state interface{}
 	return t.punctuationTokenizer.Tokenize(unsafeString(found), tokens, state)
 }
 
-func (t *jsonTokenizer) Join(tokens []string, state interface{}) string {
-	return fmt.Sprintf("%s%s%s", t.varReplace, t.punctuationTokenizer.Join(tokens, state), t.varReplace)
+func (t *jsonTokenizer) Join(tokens []unique.Handle[string], state interface{}) string {
+	return fmt.Sprintf("%s%s%s", t.varReplace.Value(), t.punctuationTokenizer.Join(tokens, state), t.varReplace.Value())
 }
 
 func isVariableField(key []byte) bool {
@@ -289,9 +284,9 @@ func isVariableField(key []byte) bool {
 
 type DedupingTokenizer struct {
 	LineTokenizer
-	dedupParam string
+	dedupParam unique.Handle[string]
 }
 
-func (d DedupingTokenizer) Join(tokens []string, state interface{}) string {
+func (d DedupingTokenizer) Join(tokens []unique.Handle[string], state interface{}) string {
 	return deduplicatePlaceholders(d.LineTokenizer.Join(tokens, state), d.dedupParam)
 }

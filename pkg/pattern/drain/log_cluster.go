@@ -3,6 +3,7 @@ package drain
 import (
 	"strings"
 	"time"
+	"unique"
 
 	"github.com/prometheus/common/model"
 
@@ -13,9 +14,9 @@ import (
 type LogCluster struct {
 	id         int
 	Size       int
-	Tokens     []string
+	Tokens     []unique.Handle[string]
 	TokenState interface{}
-	Stringer   func([]string, interface{}) string
+	Stringer   func([]unique.Handle[string], interface{}) string
 
 	Chunks Chunks
 }
@@ -24,7 +25,12 @@ func (c *LogCluster) String() string {
 	if c.Stringer != nil {
 		return c.Stringer(c.Tokens, c.TokenState)
 	}
-	return strings.Join(c.Tokens, " ")
+
+	tokens := make([]string, 0, len(c.Tokens))
+	for _, t := range c.Tokens {
+		tokens = append(tokens, t.Value())
+	}
+	return strings.Join(tokens, " ")
 }
 
 func (c *LogCluster) append(ts model.Time) {

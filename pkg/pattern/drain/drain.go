@@ -27,6 +27,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unique"
 	"unsafe"
 
 	"github.com/hashicorp/golang-lru/v2/simplelru"
@@ -42,7 +43,7 @@ type Config struct {
 	MaxChildren          int
 	ExtraDelimiters      []string
 	MaxClusters          int
-	ParamString          string
+	ParamString          unique.Handle[string]
 	MaxEvictionRatio     float64
 	MaxAllowedLineLength int
 }
@@ -79,13 +80,13 @@ func (c *LogClusterCache) Get(key int) *LogCluster {
 
 func createNode() *Node {
 	return &Node{
-		keyToChildNode: make(map[string]*Node),
+		keyToChildNode: make(map[unique.Handle[string]]*Node),
 		clusterIDs:     make([]int, 0),
 	}
 }
 
 type Node struct {
-	keyToChildNode map[string]*Node
+	keyToChildNode map[unique.Handle[string]]*Node
 	clusterIDs     []int
 }
 
@@ -128,7 +129,7 @@ func DefaultConfig() *Config {
 		// "similar" clusters, but the greater the footprint.
 		SimTh:                0.3,
 		MaxChildren:          15,
-		ParamString:          `<_>`,
+		ParamString:          unique.Make(`<_>`),
 		MaxClusters:          300,
 		MaxEvictionRatio:     0.25,
 		MaxAllowedLineLength: 3000,
@@ -188,7 +189,7 @@ type Drain struct {
 	metrics         *Metrics
 	tokenizer       LineTokenizer
 	format          string
-	tokens          []string
+	tokens          []unique.Handle[string]
 	state           interface{}
 	limiter         *limiter
 	pruning         bool
@@ -198,7 +199,7 @@ func (d *Drain) Clusters() []*LogCluster {
 	return d.idToCluster.Values()
 }
 
-func (d *Drain) TrainTokens(tokens []string, stringer func([]string) string, ts int64) *LogCluster {
+func (d *Drain) TrainTokens(tokens []unique.Handle[string], stringer func([]string) string, ts int64) *LogCluster {
 	return d.train(tokens, stringer, ts)
 }
 
@@ -213,7 +214,7 @@ func (d *Drain) Train(content string, ts int64) *LogCluster {
 	return d.train(d.tokens, d.state, ts)
 }
 
-func (d *Drain) train(tokens []string, state interface{}, ts int64) *LogCluster {
+func (d *Drain) train(tokens []unique.Handle[string], state interface{}, ts int64) *LogCluster {
 	if len(tokens) < 4 {
 		return nil
 	}
@@ -252,6 +253,12 @@ func (d *Drain) train(tokens []string, state interface{}, ts int64) *LogCluster 
 	return matchCluster
 }
 
+func (d *Drain) cloneHandles(tokens []unique.Handle[string]) []unique.Handle[string] {
+	clone := make([]unique.Handle[string], len(tokens))
+	copy(clone, tokens)
+	return clone
+}
+
 func (d *Drain) TrainPattern(content string, samples []*logproto.PatternSample) *LogCluster {
 	tokens, state := d.tokenizer.Tokenize(content, d.tokens, d.state)
 	matchCluster := d.treeSearch(d.rootNode, tokens, d.config.SimTh, true)
@@ -276,22 +283,23 @@ func (d *Drain) TrainPattern(content string, samples []*logproto.PatternSample) 
 	return matchCluster
 }
 
-func deduplicatePlaceholders(line string, placeholder string) string {
+func deduplicatePlaceholders(line string, placeholder unique.Handle[string]) string {
 	first := strings.Index(line, "<_><_>")
 	if first == -1 {
 		return line
 	}
 	builder := make([]byte, 0, len(line))
 	low := 0
+	placeholderLen := len(placeholder.Value())
 	for i := first; i < len(line)-5; i++ {
-		if line[i:i+len(placeholder)] == placeholder {
+		if line[i:i+placeholderLen] == placeholder.Value() {
 			high := i + 3
 			for ; high < len(line)-2; high += 3 {
-				if line[high:high+len(placeholder)] != placeholder {
+				if line[high:high+placeholderLen] != placeholder.Value() {
 					break
 				}
 			}
-			builder = append(builder, line[low:i+len(placeholder)]...)
+			builder = append(builder, line[low:i+placeholderLen]...)
 			low = high
 			i = high
 		}
@@ -328,11 +336,11 @@ func (d *Drain) Delete(cluster *LogCluster) {
 	d.pruning = false
 }
 
-func (d *Drain) treeSearch(rootNode *Node, tokens []string, simTh float64, includeParams bool) *LogCluster {
+func (d *Drain) treeSearch(rootNode *Node, tokens []unique.Handle[string], simTh float64, includeParams bool) *LogCluster {
 	tokenCount := len(tokens)
 
 	// at first level, children are grouped by token (word) count
-	curNode, ok := rootNode.keyToChildNode[strconv.Itoa(tokenCount)]
+	curNode, ok := rootNode.keyToChildNode[unique.Make(strconv.Itoa(tokenCount))]
 
 	// no template with same token count yet
 	if !ok {
@@ -374,7 +382,7 @@ func (d *Drain) treeSearch(rootNode *Node, tokens []string, simTh float64, inclu
 }
 
 // fastMatch Find the best match for a log message (represented as tokens) versus a list of clusters
-func (d *Drain) fastMatch(clusterIDs []int, tokens []string, simTh float64, includeParams bool) *LogCluster {
+func (d *Drain) fastMatch(clusterIDs []int, tokens []unique.Handle[string], simTh float64, includeParams bool) *LogCluster {
 	var matchCluster, maxCluster *LogCluster
 
 	maxSim := -1.0
@@ -402,7 +410,7 @@ func (d *Drain) fastMatch(clusterIDs []int, tokens []string, simTh float64, incl
 	return matchCluster
 }
 
-func (d *Drain) getSeqDistance(clusterTokens, tokens []string, includeParams bool) (float64, int) {
+func (d *Drain) getSeqDistance(clusterTokens, tokens []unique.Handle[string], includeParams bool) (float64, int) {
 	if len(clusterTokens) != len(tokens) {
 		panic("seq1 seq2 be of same length")
 	}
@@ -413,7 +421,7 @@ func (d *Drain) getSeqDistance(clusterTokens, tokens []string, includeParams boo
 		token1 := clusterTokens[i]
 		token2 := tokens[i]
 		// Require exact match for marked tokens
-		if len(token1) > 0 && token1[0] == 0 && token1 != token2 {
+		if len(token1.Value()) > 0 && token1.Value()[0] == 0 && token1 != token2 {
 			return 0, -1
 		}
 		if token1 == d.config.ParamString {
@@ -431,7 +439,7 @@ func (d *Drain) getSeqDistance(clusterTokens, tokens []string, includeParams boo
 
 func (d *Drain) addSeqToPrefixTree(rootNode *Node, cluster *LogCluster) {
 	tokenCount := len(cluster.Tokens)
-	tokenCountStr := strconv.Itoa(tokenCount)
+	tokenCountStr := unique.Make(strconv.Itoa(tokenCount))
 
 	firstLayerNode, ok := rootNode.keyToChildNode[tokenCountStr]
 	if !ok {
@@ -464,7 +472,7 @@ func (d *Drain) addSeqToPrefixTree(rootNode *Node, cluster *LogCluster) {
 
 		// if token not matched in this layer of existing tree.
 		if _, ok = curNode.keyToChildNode[token]; !ok {
-			if !d.hasNumbers(token) {
+			if !d.hasNumbers(token.Value()) {
 				// Numbers in token: Prioritize the param string path
 				if _, ok = curNode.keyToChildNode[d.config.ParamString]; ok {
 					if len(curNode.keyToChildNode) < d.config.MaxChildren {
@@ -515,7 +523,7 @@ func (d *Drain) hasNumbers(s string) bool {
 	return false
 }
 
-func (d *Drain) createTemplate(tokens, matchClusterTokens []string) []string {
+func (d *Drain) createTemplate(tokens, matchClusterTokens []unique.Handle[string]) []unique.Handle[string] {
 	if len(tokens) != len(matchClusterTokens) {
 		panic("seq1 seq2 be of same length")
 	}

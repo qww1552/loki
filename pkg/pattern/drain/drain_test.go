@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unique"
 
 	"github.com/stretchr/testify/require"
 	"golang.org/x/exp/slices"
@@ -598,7 +599,7 @@ func TestDeduplicatePlaceholders(b *testing.T) {
 
 	for i, tc := range cases {
 		b.Run(fmt.Sprintf("Dedup %d", i), func(t *testing.T) {
-			got := deduplicatePlaceholders(tc.line, `<_>`)
+			got := deduplicatePlaceholders(tc.line, unique.Make(`<_>`))
 			require.Equal(t, tc.want, got)
 		})
 	}
