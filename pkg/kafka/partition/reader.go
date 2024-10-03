@@ -367,14 +367,13 @@ func (p *Reader) processNextFetchesUntilLagHonored(ctx context.Context, maxLag t
 		// lag. If we don't have it (lag is zero value), then it will not be logged.
 		level.Info(loggerWithCurrentLagIfSet(logger, currLag)).Log("msg", "partition reader is consuming records to honor target and max consumer lag", "partition_start_offset", partitionStartOffset, "last_produced_offset", lastProducedOffset)
 
-		for boff.Ongoing() {
+		for boff.Ongoing() && ctx.Err() == nil {
 			// Continue reading until we reached the desired offset.
 			if lastProducedOffset <= p.lastProcessedOffset {
 				break
 			}
 
-			records := p.poll(ctx)
-			recordsChan <- records
+			recordsChan <- p.poll(ctx)
 		}
 		if boff.Err() != nil {
 			return 0, boff.ErrCause()

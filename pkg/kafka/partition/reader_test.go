@@ -2,6 +2,7 @@ package partition
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"github.com/twmb/franz-go/pkg/kgo"
 
 	"github.com/grafana/loki/v3/pkg/kafka"
 	"github.com/grafana/loki/v3/pkg/kafka/testkafka"
@@ -43,6 +45,41 @@ func (m *mockConsumer) Start(ctx context.Context, recordsChan <-chan []Record) f
 				if !ok {
 					return
 				}
+				m.recordsChan <- records
+			}
+		}
+	}()
+	return m.wg.Wait
+}
+
+type mockSlowConsumer struct {
+	mock.Mock
+	recordsChan chan []Record
+	controlChan <-chan struct{}
+	wg          sync.WaitGroup
+}
+
+func newMockSlowConsumer(controlChan <-chan struct{}) *mockSlowConsumer {
+	return &mockSlowConsumer{
+		recordsChan: make(chan []Record, 100),
+		controlChan: controlChan,
+	}
+}
+
+func (m *mockSlowConsumer) Start(ctx context.Context, recordsChan <-chan []Record) func() {
+	start := time.Now()
+	m.wg.Add(1)
+	go func() {
+		defer m.wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				fmt.Println("Context done", time.Since(start))
+				return
+			case <-m.controlChan:
+				fmt.Println("Control chan fired", time.Since(start))
+				records := <-recordsChan
+				fmt.Println("Writing records", len(records), time.Since(start))
 				m.recordsChan <- records
 			}
 		}
@@ -160,4 +197,63 @@ func TestPartitionReader_ProcessCatchUpAtStartup(t *testing.T) {
 
 	err = services.StopAndAwaitTerminated(context.Background(), partitionReader)
 	require.NoError(t, err)
+}
+
+func TestPartitionReader_ProcessCommits(t *testing.T) {
+	_, kafkaCfg := testkafka.CreateCluster(t, 1, "test-topic")
+	controlChan := make(chan struct{})
+	consumer := newMockSlowConsumer(controlChan)
+
+	consumerFactory := func(_ Committer) (Consumer, error) {
+		return consumer, nil
+	}
+
+	partitionReader, err := NewReader(kafkaCfg, 0, "test-consumer-group", consumerFactory, log.NewNopLogger(), prometheus.NewRegistry())
+	require.NoError(t, err)
+	producer, err := kafka.NewWriterClient(kafkaCfg, 100, log.NewNopLogger(), prometheus.NewRegistry())
+	require.NoError(t, err)
+
+	// Init the client: This usually happens in "start" but we want to manage our own lifecycle for this test.
+	partitionReader.client, err = kafka.NewReaderClient(kafkaCfg, nil, log.NewNopLogger(),
+		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
+			kafkaCfg.Topic: {0: kgo.NewOffset().AtStart()},
+		}),
+	)
+	require.NoError(t, err)
+
+	stream := logproto.Stream{
+		Labels:  labels.FromStrings("foo", "bar").String(),
+		Entries: []logproto.Entry{{Timestamp: time.Now(), Line: "test"}},
+	}
+
+	records, err := kafka.Encode(0, "test-tenant", stream, 10<<20)
+	require.NoError(t, err)
+	require.Len(t, records, 1)
+
+	producer.ProduceSync(context.Background(), records...)
+	producer.ProduceSync(context.Background(), records...)
+
+	targetLag := time.Second * 1
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(targetLag*2))
+	recordsChan := make(chan []Record)
+	wait := consumer.Start(ctx, recordsChan)
+	// Delay the reads from kafka by longer than the target lag, this triggers fetches to retry until we are caught up.
+	kafkaReads := 0
+	time.AfterFunc(targetLag+time.Millisecond*100, func() {
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			controlChan <- struct{}{}
+			kafkaReads++
+		}
+	})
+	_, err = partitionReader.processNextFetchesUntilLagHonored(ctx, targetLag, log.NewNopLogger(), recordsChan)
+	assert.NoError(t, err)
+	// We should have read 3 times, the first read will be longer than maxLag, triggering the second, then a third to be sure we are caught up.
+	assert.Equal(t, 3, kafkaReads)
+
+	cancel()
+	close(recordsChan)
+	wait()
 }
