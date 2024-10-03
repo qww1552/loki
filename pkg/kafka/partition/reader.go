@@ -274,7 +274,7 @@ func (p *Reader) processNextFetchesUntilTargetOrMaxLagHonored(ctx context.Contex
 	attempts := []func() (currLag time.Duration, _ error){
 		// First process fetches until at least the max lag is honored.
 		func() (time.Duration, error) {
-			return p.processNextFetchesUntilLagHonored(ctx, maxLag, logger, recordsChan)
+			return p.processNextFetchesUntilLagHonored(ctx, maxLag, logger, recordsChan, time.Since)
 		},
 
 		// If the target lag hasn't been reached with the first attempt (which stops once at least the max lag
@@ -287,13 +287,13 @@ func (p *Reader) processNextFetchesUntilTargetOrMaxLagHonored(ctx context.Contex
 			timedCtx, cancel := context.WithTimeoutCause(ctx, maxLag, errWaitTargetLagDeadlineExceeded)
 			defer cancel()
 
-			return p.processNextFetchesUntilLagHonored(timedCtx, targetLag, logger, recordsChan)
+			return p.processNextFetchesUntilLagHonored(timedCtx, targetLag, logger, recordsChan, time.Since)
 		},
 
 		// If the target lag hasn't been reached with the previous attempt that we'll move on. However,
 		// we still need to guarantee that in the meanwhile the lag didn't increase and max lag is still honored.
 		func() (time.Duration, error) {
-			return p.processNextFetchesUntilLagHonored(ctx, maxLag, logger, recordsChan)
+			return p.processNextFetchesUntilLagHonored(ctx, maxLag, logger, recordsChan, time.Since)
 		},
 	}
 
@@ -326,7 +326,7 @@ func (p *Reader) processNextFetchesUntilTargetOrMaxLagHonored(ctx context.Contex
 	return nil
 }
 
-func (p *Reader) processNextFetchesUntilLagHonored(ctx context.Context, maxLag time.Duration, logger log.Logger, recordsChan chan<- []Record) (time.Duration, error) {
+func (p *Reader) processNextFetchesUntilLagHonored(ctx context.Context, maxLag time.Duration, logger log.Logger, recordsChan chan<- []Record, timeSince func(time.Time) time.Duration) (time.Duration, error) {
 	boff := backoff.New(ctx, backoff.Config{
 		MinBackoff: 100 * time.Millisecond,
 		MaxBackoff: time.Second,
@@ -367,13 +367,14 @@ func (p *Reader) processNextFetchesUntilLagHonored(ctx context.Context, maxLag t
 		// lag. If we don't have it (lag is zero value), then it will not be logged.
 		level.Info(loggerWithCurrentLagIfSet(logger, currLag)).Log("msg", "partition reader is consuming records to honor target and max consumer lag", "partition_start_offset", partitionStartOffset, "last_produced_offset", lastProducedOffset)
 
-		for boff.Ongoing() && ctx.Err() == nil {
+		for boff.Ongoing() {
 			// Continue reading until we reached the desired offset.
 			if lastProducedOffset <= p.lastProcessedOffset {
 				break
 			}
 
-			recordsChan <- p.poll(ctx)
+			records := p.poll(ctx)
+			recordsChan <- records
 		}
 		if boff.Err() != nil {
 			return 0, boff.ErrCause()
@@ -381,7 +382,7 @@ func (p *Reader) processNextFetchesUntilLagHonored(ctx context.Context, maxLag t
 
 		// If it took less than the max desired lag to replay the partition
 		// then we can stop here, otherwise we'll have to redo it.
-		if currLag = time.Since(lastProducedOffsetRequestedAt); currLag <= maxLag {
+		if currLag = timeSince(lastProducedOffsetRequestedAt); currLag <= maxLag {
 			return currLag, nil
 		}
 	}
