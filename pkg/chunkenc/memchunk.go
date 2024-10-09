@@ -32,6 +32,7 @@ const (
 	ChunkFormatV2
 	ChunkFormatV3
 	ChunkFormatV4
+	ChunkFormatV5
 
 	blocksPerChunk = 10
 	maxLineLength  = 1024 * 1024 * 1024
@@ -45,6 +46,7 @@ const (
 	chunkStructuredMetadataSectionIdx = 2
 )
 
+// todo(shantanu): add format here for tests
 var HeadBlockFmts = []HeadBlockFmt{OrderedHeadBlockFmt, UnorderedHeadBlockFmt, UnorderedWithStructuredMetadataHeadBlockFmt}
 
 type HeadBlockFmt byte
@@ -59,6 +61,8 @@ func (f HeadBlockFmt) String() string {
 		return "unordered"
 	case f == UnorderedWithStructuredMetadataHeadBlockFmt:
 		return "unordered with structured metadata"
+	case f == UnorderedWithOrganizedStructuredMetadataHeadBlockFmt:
+		return "unordered with organized structured metadata"
 	default:
 		return fmt.Sprintf("unknown: %v", byte(f))
 	}
@@ -82,6 +86,7 @@ const (
 	OrderedHeadBlockFmt
 	UnorderedHeadBlockFmt
 	UnorderedWithStructuredMetadataHeadBlockFmt
+	UnorderedWithOrganizedStructuredMetadataHeadBlockFmt
 )
 
 // ChunkHeadFormatFor returns corresponding head block format for the given `chunkfmt`.
@@ -94,8 +99,11 @@ func ChunkHeadFormatFor(chunkfmt byte) HeadBlockFmt {
 		return UnorderedHeadBlockFmt
 	}
 
-	// return the latest head format for all chunkformat >v3
-	return UnorderedWithStructuredMetadataHeadBlockFmt
+	if chunkfmt == ChunkFormatV4 {
+		return UnorderedWithStructuredMetadataHeadBlockFmt
+	}
+	// return the latest head format for all chunkformat >v4
+	return UnorderedWithOrganizedStructuredMetadataHeadBlockFmt
 }
 
 var magicNumber = uint32(0x12EE56A)
@@ -304,9 +312,9 @@ func (hb *headBlock) LoadBytes(b []byte) error {
 		return errors.Wrap(db.err(), "verifying headblock header")
 	}
 	switch version {
-	case ChunkFormatV1, ChunkFormatV2, ChunkFormatV3, ChunkFormatV4:
+	case ChunkFormatV1, ChunkFormatV2, ChunkFormatV3, ChunkFormatV4, ChunkFormatV5:
 	default:
-		return errors.Errorf("incompatible headBlock version (%v), only V1,V2,V3 is currently supported", version)
+		return errors.Errorf("incompatible headBlock version (%v), only V1 to V5 is currently supported", version)
 	}
 
 	ln := db.uvarint()
@@ -364,8 +372,10 @@ func panicIfInvalidFormat(chunkFmt byte, head HeadBlockFmt) {
 		panic("only OrderedHeadBlockFmt is supported for V2 chunks")
 	}
 	if chunkFmt == ChunkFormatV4 && head != UnorderedWithStructuredMetadataHeadBlockFmt {
-		fmt.Println("received head fmt", head.String())
 		panic("only UnorderedWithStructuredMetadataHeadBlockFmt is supported for V4 chunks")
+	}
+	if chunkFmt == ChunkFormatV5 && head != UnorderedWithOrganizedStructuredMetadataHeadBlockFmt {
+		panic("only UnorderedWithOrganizedStructuredMetadataHeadBlockFmt is supported for V5 chunks")
 	}
 }
 
@@ -415,7 +425,7 @@ func newByteChunk(b []byte, blockSize, targetSize int, fromCheckpoint bool) (*Me
 	switch version {
 	case ChunkFormatV1:
 		bc.encoding = compression.GZIP
-	case ChunkFormatV2, ChunkFormatV3, ChunkFormatV4:
+	case ChunkFormatV2, ChunkFormatV3, ChunkFormatV4, ChunkFormatV5:
 		// format v2+ has a byte for block encoding.
 		enc := compression.Codec(db.byte())
 		if db.err() != nil {
@@ -668,7 +678,6 @@ func (c *MemChunk) writeTo(w io.Writer, forCheckpoint bool) (int64, error) {
 		}
 		offset += int64(n)
 	}
-
 	// Write Blocks.
 	for i, b := range c.blocks {
 		c.blocks[i].offset = int(offset)
