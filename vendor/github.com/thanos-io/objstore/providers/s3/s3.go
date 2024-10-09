@@ -15,7 +15,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/efficientgo/core/logerrcapture"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/minio/minio-go/v7"
@@ -176,13 +175,13 @@ func parseConfig(conf []byte) (Config, error) {
 }
 
 // NewBucket returns a new Bucket using the provided s3 config values.
-func NewBucket(logger log.Logger, conf []byte, component string) (*Bucket, error) {
+func NewBucket(logger log.Logger, conf []byte, component string, rt http.RoundTripper) (*Bucket, error) {
 	config, err := parseConfig(conf)
 	if err != nil {
 		return nil, err
 	}
 
-	return NewBucketWithConfig(logger, config, component)
+	return NewBucketWithConfig(logger, config, component, rt)
 }
 
 type overrideSignerType struct {
@@ -202,7 +201,7 @@ func (s *overrideSignerType) Retrieve() (credentials.Value, error) {
 }
 
 // NewBucketWithConfig returns a new Bucket using the provided s3 config values.
-func NewBucketWithConfig(logger log.Logger, config Config, component string) (*Bucket, error) {
+func NewBucketWithConfig(logger log.Logger, config Config, component string, rt http.RoundTripper) (*Bucket, error) {
 	var chain []credentials.Provider
 
 	// TODO(bwplotka): Don't do flags as they won't scale, use actual params like v2, v4 instead
@@ -242,25 +241,25 @@ func NewBucketWithConfig(logger log.Logger, config Config, component string) (*B
 			}),
 		}
 	}
-
+	if rt != nil {
+		config.HTTPConfig.Transport = rt
+	}
 	// Check if a roundtripper has been set in the config
 	// otherwise build the default transport.
-	var rt http.RoundTripper
+	var tpt http.RoundTripper
+	tpt, err := exthttp.DefaultTransport(config.HTTPConfig)
+	if err != nil {
+		return nil, err
+	}
 	if config.HTTPConfig.Transport != nil {
-		rt = config.HTTPConfig.Transport
-	} else {
-		var err error
-		rt, err = exthttp.DefaultTransport(config.HTTPConfig)
-		if err != nil {
-			return nil, err
-		}
+		tpt = config.HTTPConfig.Transport
 	}
 
 	client, err := minio.New(config.Endpoint, &minio.Options{
 		Creds:        credentials.NewChainCredentials(chain),
 		Secure:       !config.Insecure,
 		Region:       config.Region,
-		Transport:    rt,
+		Transport:    tpt,
 		BucketLookup: config.BucketLookupType.MinioType(),
 	})
 	if err != nil {
@@ -438,21 +437,12 @@ func (b *Bucket) getRange(ctx context.Context, name string, off, length int64) (
 			return nil, err
 		}
 	}
-	r, err := b.client.GetObject(ctx, b.name, name, *opts)
-	if err != nil {
+
+	// StatObject to see if the object exists and we have permissions to read it
+	if _, err := b.client.StatObject(ctx, b.name, name, *opts); err != nil {
 		return nil, err
 	}
-
-	// NotFoundObject error is revealed only after first Read. This does the initial GetRequest. Prefetch this here
-	// for convenience.
-	if _, err := r.Read(nil); err != nil {
-		defer logerrcapture.Do(b.logger, r.Close, "s3 get range obj close")
-
-		// First GET Object request error.
-		return nil, err
-	}
-
-	return r, nil
+	return b.client.GetObject(ctx, b.name, name, *opts)
 }
 
 // Get returns a reader for the given object name.
@@ -611,7 +601,7 @@ func NewTestBucketFromConfig(t testing.TB, location string, c Config, reuseBucke
 	if err != nil {
 		return nil, nil, err
 	}
-	b, err := NewBucket(log.NewNopLogger(), bc, "thanos-e2e-test")
+	b, err := NewBucket(log.NewNopLogger(), bc, "thanos-e2e-test", nil)
 	if err != nil {
 		return nil, nil, err
 	}
